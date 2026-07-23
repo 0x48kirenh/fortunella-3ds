@@ -100,6 +100,9 @@ private:
     std::size_t generation = 0; // Incremented once each time the barrier is used
 };
 
+/// Hybrid spin-then-sleep barrier.
+/// Spins for a short period for low latency, then falls back to a condition
+/// variable wait to conserve CPU when threads take longer to arrive.
 class SpinBarrier {
 public:
     explicit SpinBarrier(std::size_t count_) : total(count_) {}
@@ -110,22 +113,57 @@ public:
         if (arrived.fetch_add(1, std::memory_order_acq_rel) + 1 == total) {
             arrived.store(0, std::memory_order_relaxed);
             generation.store(gen + 1, std::memory_order_release);
+            {
+                std::scoped_lock lk{mutex};
+            }
+            condvar.notify_all();
             return true;
         }
 
-        while (generation.load(std::memory_order_acquire) == gen) {
+        // Phase 1: Spin for low latency when other threads are about to arrive.
+        for (int i = 0; i < SpinIterations; ++i) {
+            if (generation.load(std::memory_order_acquire) != gen) {
+                return true;
+            }
             if (token.stop_requested()) [[unlikely]] {
                 return false;
             }
             __builtin_ia32_pause();
         }
-        return true;
+
+        // Phase 2: Yield to OS scheduler — moderate latency, lower power.
+        for (int i = 0; i < YieldIterations; ++i) {
+            if (generation.load(std::memory_order_acquire) != gen) {
+                return true;
+            }
+            if (token.stop_requested()) [[unlikely]] {
+                return false;
+            }
+            std::this_thread::yield();
+        }
+
+        // Phase 3: Sleep on a condition variable — highest efficiency.
+        {
+            std::unique_lock lk{mutex};
+            condvar.wait_for(lk, std::chrono::microseconds(SleepIntervalUs),
+                             [this, gen, &token] {
+                                 return generation.load(std::memory_order_acquire) != gen ||
+                                        token.stop_requested();
+                             });
+        }
+        return !token.stop_requested();
     }
 
 private:
+    static constexpr int SpinIterations = 1000;
+    static constexpr int YieldIterations = 10;
+    static constexpr int SleepIntervalUs = 100;
+
     std::size_t total;
     std::atomic<std::size_t> arrived{0};
     std::atomic<std::size_t> generation{0};
+    std::mutex mutex;
+    std::condition_variable condvar;
 };
 
 enum class ThreadPriority : u32 {
