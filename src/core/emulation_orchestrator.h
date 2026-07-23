@@ -31,7 +31,6 @@ private:
 
     System& system;
     std::unique_ptr<CpuThreadPool> cpu_pool;
-    bool pending_swap = false;
 };
 
 } // namespace Core

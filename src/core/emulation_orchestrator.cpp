@@ -126,27 +126,16 @@ System::ResultStatus EmulationOrchestrator::RunFrame() {
         cpu_pool->Start();
     }
 
-    // Pipeline: kick the first CPU slice, then do the pending SwapBuffers from
-    // the previous frame *while the workers are busy*. This overlaps rendering
-    // (~1-5ms) with CPU execution instead of serializing them.
-    cpu_pool->KickAll();
-
-    if (pending_swap) {
-        system.GPU().Renderer().SwapBuffers();
-        pending_swap = false;
-    }
-
-    cpu_pool->WaitAll();
-
-    // Run more slices until VBlank fires.
+    // Run slices until VBlank fires, then present the frame.
+    // SwapBuffers MUST happen after WaitAll — never in parallel with workers,
+    // because SwapBuffers can evict GPU surfaces that workers' BlitTextures still references.
     while (!system.GPU().IsFrameReady()) {
         cpu_pool->KickAll();
         cpu_pool->WaitAll();
     }
 
     system.GPU().ClearFrameReady();
-    // Defer SwapBuffers to next RunFrame call so it overlaps with CPU work.
-    pending_swap = true;
+    system.GPU().Renderer().SwapBuffers();
 
     return system.status;
 }
